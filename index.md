@@ -1,7 +1,4 @@
-This is your home page! Write whatever comes to mind.
+欢迎来到编写人生的博客，我是一位有着20多年架构经验的软件架构师，主要从事企业应用软件的架构设计，我很乐意与您分享软件设计和生活。
 
-Maybe an about me section, or a short bio.
+这个站点也是 [tansm.cnblogs.com](https://tansm.cnblogs.com) 的镜像站点。
 
-Or maybe you can write a small summary about your blog.
-
-Whatever you want!
