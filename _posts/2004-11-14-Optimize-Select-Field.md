@@ -16,7 +16,7 @@
  IList allOperators = OperatorManager.Open(typeof(OperatorSummary),OperatorManager.GetAllIds());
 ```
 
-![Operator](2004-11-14-Operator.jpg)
+![Operator](/images/20041114_Operator.jpg)
 
 老实说这是一个好主意,但我还是觉得有些别扭,他也提到如果需要不同的简化结果,就要不同的简化类,继承关系也很难实现.
 
