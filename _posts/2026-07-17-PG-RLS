@@ -1,0 +1,55 @@
+PostgreSQL 社区这几年的共识是——**Bridge 模型(schema-per-tenant)本身在 PG 上没有什么"魔法优化"能把成本压下来,反而随着租户数增长会暴露出一堆隐藏成本,业界更常见的做法是绕开这个问题,而不是优化它**。分开说清楚。
+
+## Bridge 模型(schema-per-tenant)在 PG 上的真实成本,比想象中更隐蔽
+
+Bridge 模型的直觉成本是"隔离性好,但要多建很多 schema",听起来只是多了点管理开销,但实际踩坑的地方主要在这几处([Stack Overflow 上多个真实案例讨论](https://stackoverflow.com/questions/50722568/postgresql-multitenant-schemas-vs-databases)):
+
+- **系统目录膨胀(catalog bloat)**:PG 每个 schema 下的每张表,都会在 `pg_class`、`pg_attribute` 等系统目录表里留一条记录。如果有 500 个租户、每个租户 200 张表,系统目录里就要塞 10 万行元数据。查询规划器(planner)在处理 SQL 时要频繁查这些目录表,规模一大,规划阶段本身就会变慢,这是很多人反馈"schema 一多,PG 就变慢"的根本原因,官方甚至建议不要用几十万级别的 schema 数量。
+- **连接池失效**:这是最容易被低估的一点。PgBouncer 这类连接池工具,如果想用性能最好的 **transaction 模式**做连接复用,前提是连接不能带有"会话级状态"。但 schema-per-tenant 通常靠 `SET search_path` 来切换到当前租户的 schema,这恰恰是一种会话状态,一旦用了 transaction 模式连接池,`search_path` 就可能在租户之间串掉,逼着很多团队退回到低效的 session 模式连接池,直接推高了连接数和内存开销([相关讨论](https://dzone.com/articles/database-connection-pooling-at-scale-pgbouncer-mul))。
+- **迁移脚本要按 schema 跑 N 遍**:每次 DDL 变更(加字段、加索引),都得对着几百个 schema 挨个跑一遍迁移脚本,耗时和出错概率随租户数线性增长,这也是为什么之前讨论的 Expand/Contract 灰度原则,在 schema-per-tenant 场景下执行起来特别麻烦。
+
+一篇最近的文章标题就很直接地体现了这个共识:["One Database, Thousands of Tenants: Why I Argued Against Schema-per-Tenant"](https://medium.com/@niranganiluminda/one-database-thousands-of-tenants-why-i-argued-against-schema-per-tenant-834489e00a6d)。也就是说,Bridge 模型的成本不只是"比 Pool 贵一点",而是随着租户规模增长,会有一些非线性变差的隐藏坑,PG 内核层面并没有专门为"很多 schema"这个场景做过重点优化。
+
+## PG 生态给出的答案:不是优化 Bridge,而是用 RLS 让 Pool 变得更安全
+
+这也是为什么这几年 PG 社区在多租户场景上的主流建议,越来越倾向于:**如果租户数量大,别用 schema-per-tenant,改用共享表 + Row-Level Security(RLS)**,把 Pool 模型原本"隔离弱"这个短板补上,而不是反过来把 Bridge 做得更便宜。
+
+RLS 是 PostgreSQL 9.5 引入的原生特性,核心做法是在数据库存储层定义安全策略,对每张表的 `SELECT`/`INSERT`/`UPDATE`/`DELETE` 自动注入一个隐式的 `WHERE tenant_id = current_tenant()` 过滤条件。关键价值在于,这个过滤是在**存储层强制执行的,低于应用层、低于 ORM、低于连接池**([具体机制说明](https://www.jusdb.com/blog/postgresql-row-level-security-multi-tenant-isolation))。这意味着即便应用代码某处忘了加 tenant_id 条件,数据库自己也会挡住越权访问,把之前 Pool 模型"隔离性最弱"这个短板,补到了接近 Bridge 的安全水位,但保留了 Pool 模型的成本优势——同一套表结构、同一份系统目录、连接池可以随便用 transaction 模式。
+
+一篇 2026 年的 SaaS 架构决策指南直接给出建议:如果要选多租户模型,起步就用 **pooled + PostgreSQL RLS**,等真正遇到需要物理隔离的大客户时,再单独为这些客户做 Bridge 迁移([来源](https://www.marsdevs.com/compare/multi-tenant-vs-single-tenant-saas))。这基本回答了你的问题:PG 没有让 Bridge 变便宜的专门优化,但有让 Pool 变安全的专门优化(RLS),业界更倾向于走后面这条路。
+
+## 如果你的场景确实需要 Bridge 级别的隔离,又想要规模化:Citus 的 Schema-based Sharding
+
+如果隔离性要求高到不能只靠 RLS(比如合规要求物理隔离,或者不同租户数据量差异极大,大租户需要单独调优),PG 生态里有一个专门针对这个场景做的扩展方案:**Citus**(微软收购的 PG 分布式扩展,现在是 Azure Database for PostgreSQL 的官方选项之一)在 2023 年推出了 [Schema-based Sharding](https://www.citusdata.com/blog/2023/07/31/schema-based-sharding-comes-to-postgres-with-citus/)。
+
+它的思路正好是冲着 Bridge 模型的痛点设计的:每个租户的 schema 被当作一个"逻辑分片(shard)",Citus 会把不同租户的 schema **分布到不同的物理节点**上,而不是全部堆在一个实例的系统目录里。也就是说,你仍然享受 Bridge 模型"每个租户 schema 独立"的隔离体验,但底层的系统目录膨胀、单机容量瓶颈问题,被 Citus 用横向扩展的方式绕开了——租户多了就加节点,不会全部集中冲击一个 PG 实例的 `pg_class`。这基本是目前 PG 生态里,唯一一个认真尝试解决"Bridge 模型规模化成本"这个具体问题的方案。
+
+## 小结
+
+| 方案 | 本质 | 适合场景 |
+|---|---|---|
+| 继续用 schema-per-tenant(原生 Bridge) | 不做特殊优化,靠控制 schema 总数(建议不超过几百到一千级别)来避免系统目录膨胀 | 租户数量有限、增长可预期的场景 |
+| Pool + RLS | 用存储层强制访问控制补足 Pool 的隔离短板,规避 Bridge 的所有成本问题 | 租户数量大、增长快、隔离要求不需要物理级别的场景,是目前的主流推荐 |
+| Citus Schema-based Sharding | 把 Bridge 模型的 schema 当分片分布到多节点,横向扩展系统目录压力 | 确实需要 schema 级物理隔离,同时租户规模会持续增长到无法塞进单机的场景 |
+
+挑几篇覆盖不同层次的,从官方权威定义到实战避坑,顺序按"先懂原理,再懂怎么用好,再懂哪里容易踩坑"排列。
+
+## 官方权威文档
+
+**[PostgreSQL 官方文档:Row Security Policies](https://www.postgresql.org/docs/current/ddl-rowsecurity.html)** — 最权威的起点,讲清楚 RLS 的基本机制:默认情况下表没有任何策略,一旦用 `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` 开启,所有正常访问都必须经过策略校验才能放行(表的所有者默认不受此限制,这个细节容易被忽略,后面配置多租户时要单独处理)。想理解 RLS 到底是什么,应该先看这篇。
+
+**[PostgreSQL 官方文档:CREATE POLICY](https://www.postgresql.org/docs/current/sql-createpolicy.html)** — 具体的策略定义语法参考,讲清楚 `USING` 和 `WITH CHECK` 两个子句的区别(前者控制现有行能不能被看到,后者控制新插入/更新的行是否合规),以及策略可以按命令类型(SELECT/INSERT/UPDATE/DELETE)和角色分别定义。写第一条 RLS 策略之前值得对着这篇过一遍参数。
+
+## 实战应用指南
+
+**[Mastering PostgreSQL Row-Level Security (RLS) for Rock-Solid Multi-Tenancy](https://ricofritzsche.me/mastering-postgresql-row-level-security-rls-for-rock-solid-multi-tenancy/)** — 专门针对多租户场景写的实操教程,从零搭建一套基于 RLS 的租户隔离方案,适合直接照着思路落地。
+
+**[PostgreSQL Row Level Security (RLS): Multi-Tenant Access Control in Practice](https://www.jusdb.com/blog/postgresql-row-level-security-multi-tenant-isolation)** — 强调了一个我们之前讨论时提到的关键点:RLS 的过滤是在存储层生效的,比应用层、ORM、连接池都更底层,这意味着即使应用代码疏漏了过滤条件,数据库自己也能兜底拦截,这是 RLS 相比纯 Pool 模型(应用层手动加 tenant_id 过滤)最核心的安全提升。
+
+## 避坑与批判视角(这两篇价值最高,建议重点看)
+
+**[Postgres Row-Level Security Footguns](https://www.bytebase.com/blog/postgres-row-level-security-footguns/)** — 这篇是目前找到的质量最高的一篇,系统梳理了 RLS 和查询规划器、视图语义、连接池、约束交互时容易踩的坑。原文明确指出这些坑不只是"影响性能",有些会在测试时看起来完全正常,却悄悄把数据泄露给了不该看到的人,值得在生产上线前逐条对照检查。
+
+**[PostgreSQL Row-Level Security is NOT Using Table Indexes](https://stackoverflow.com/questions/75631812/postgresql-row-level-security-is-not-using-table-indexes)** — 一个非常具体、影响面很广的真实性能坑:如果 RLS 策略里用到的函数/操作符不是 "leakproof"(不泄漏)的,规划器出于安全考虑,不会把这个条件下推到索引扫描之前执行,直接导致该走索引的查询退化成全表扫描,实测案例里查询慢了 300 倍。这类问题在功能测试阶段完全不会暴露,只有在数据量上来后才会发作,是 RLS 上生产前必须验证的一项。
+
+**[Postgres Row-Level Security (RLS) Limitations and Alternatives](https://www.bytebase.com/blog/postgres-row-level-security-limitations-and-alternatives)** — 从另一个角度补充,承认 RLS 强大但确实存在性能开销、灵活性受限、运维复杂度增加这几个代价,也讨论了什么场景下可能需要考虑应用层过滤或者其他方案作为替代或补充,可以帮助校准对 RLS 的预期,不至于把它当成没有成本的万能方案。
